@@ -1,70 +1,94 @@
-const { create } = require('@wppconnect-team/wppconnect');
-const path = require('path');
+const { Boom } = require('@hapi/boom')
+const { makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys')
+const qrcode = require('qrcode-terminal')
+const path = require('path')
+const fs = require('fs')
 
+// Mensagem padrão
 const respostaTexto = `Posso estar Viajando, ou não.
-
 Posso estar em Reunião, ou não.
+Deixe o motivo do seu contato e respondo assim que possível.`
 
-Deixe o motivo do seu contato e respondo assim que possível.`;
-
+// Contatos que recebem imagem aleatória
 const contatosImagem = new Set([
-  '559199790260@c.us', // sua mãe
-  '559181858191@c.us', // novo número
-]);
+  '559199790260@s.whatsapp.net', // mãe
+  '559181858191@s.whatsapp.net', // outro número VIP
+])
 
-const ultimoEnvio = {};
+const ultimoEnvio = {} // Controle de tempo por contato
 
 function imagemAleatoria() {
-  const n = Math.floor(Math.random() * 7) + 1;
-  return path.resolve(__dirname, `image/${n}.jpg`);
+  const n = Math.floor(Math.random() * 7) + 1
+  return path.resolve(__dirname, `image/${n}.jpg`)
 }
 
-console.log('Iniciando WPPConnect...');
+async function startSock() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
 
-create({
-  session: 'bot-session',
-  multidevice: true
-}).then(client => {
-  console.log('✅ Bot iniciado! Escaneie o QR code no console.');
+  const sock = makeWASocket({
+    auth: state,
+  })
 
-  client.onMessage(async message => {
-    console.log(`\n[LOG] Nova mensagem de ${message.from}: ${message.body}`);
+  sock.ev.on('creds.update', saveCreds)
 
-    if (message.from.endsWith('@g.us')) {
-      console.log('[LOG] Ignorando grupo.');
-      return;
+  // Exibe QR code no terminal para login
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update
+
+    if (qr) {
+      qrcode.generate(qr, { small: true })
+      console.log('Escaneie o QR acima com seu WhatsApp!')
     }
 
-    const contatos = await client.getAllContacts();
-    const contatosSalvos = new Set(contatos.map(c => c.id._serialized));
-    const isSalvo = contatosSalvos.has(message.from);
-    console.log(`[LOG] Contato salvo? ${isSalvo}`);
+    if (connection === 'close') {
+      const reason = lastDisconnect?.error?.output?.statusCode
+      console.log('[LOG] Conexão fechada.', reason)
+      startSock()
+    } else if (connection === 'open') {
+      console.log('[LOG] Bot conectado!')
+    }
+  })
 
-    if (!isSalvo) {
-      console.log('[LOG] Ignorando não salvo.');
-      return;
+  // Lida com mensagens recebidas
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return
+    const msg = messages[0]
+    if (!msg.message || msg.key.fromMe) return
+
+    const jid = msg.key.remoteJid
+    const isGroup = jid.endsWith('@g.us')
+    const now = Date.now()
+
+    console.log(`\n[LOG] Mensagem recebida de: ${jid}`)
+
+    // Ignora grupos
+    if (isGroup) {
+      console.log('[LOG] Grupo, ignorando.')
+      return
     }
 
-    const agora = Date.now();
-    const ultimo = ultimoEnvio[message.from];
-    if (ultimo && agora - ultimo < 2 * 60 * 60 * 1000) {
-      const minutes = ((agora - ultimo) / 1000 / 60).toFixed(1);
-      console.log(`[LOG] Mensagem enviada há ${minutes} min — pulando.`);
-      return;
+    // Controle de 2h por contato
+    if (ultimoEnvio[jid] && now - ultimoEnvio[jid] < 2 * 60 * 60 * 1000) {
+      const min = ((now - ultimoEnvio[jid]) / 1000 / 60).toFixed(1)
+      console.log(`[LOG] Já respondeu há ${min} min, ignorando.`)
+      return
     }
 
     try {
-      if (contatosImagem.has(message.from)) {
-        const imgPath = imagemAleatoria();
-        await client.sendImage(message.from, imgPath, path.basename(imgPath), '');
-        console.log(`[LOG] Enviou imagem (${imgPath}) para contato VIP (${message.from}).`);
+      if (contatosImagem.has(jid)) {
+        const imgPath = imagemAleatoria()
+        const buffer = fs.readFileSync(imgPath)
+        await sock.sendMessage(jid, { image: buffer, caption: '' })
+        console.log(`[LOG] Enviou imagem aleatória para contato VIP (${jid})`)
       } else {
-        await client.sendText(message.from, respostaTexto);
-        console.log(`[LOG] Enviou texto para ${message.from}.`);
+        await sock.sendMessage(jid, { text: respostaTexto })
+        console.log(`[LOG] Enviou mensagem padrão para ${jid}`)
       }
-      ultimoEnvio[message.from] = agora;
+      ultimoEnvio[jid] = now
     } catch (err) {
-      console.error(`[ERRO] Falha ao enviar para ${message.from}:`, err);
+      console.log(`[ERRO] Falha ao responder para ${jid}:`, err)
     }
-  });
-}).catch(err => console.error('[ERRO] Falha ao iniciar o bot:', err));
+  })
+}
+
+startSock()
